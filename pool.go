@@ -142,6 +142,16 @@ func (p *Pool) work(ctx, handlerCtx context.Context, workerID string) {
 			sleep(ctx, jitter(p.cfg.PollInterval))
 			continue
 		}
+		if ctx.Err() != nil {
+			// Shutdown began while the claim was in flight. Hand the job
+			// back instead of starting new work.
+			relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dbTimeout)
+			if err := p.client.Release(relCtx, jobs[0]); err != nil {
+				p.cfg.Logger.Error("skipq: release failed; job will run again after its lease", "job_id", jobs[0].ID, "err", err)
+			}
+			cancel()
+			return
+		}
 		p.runJob(handlerCtx, jobs[0])
 	}
 }
