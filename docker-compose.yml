@@ -19,3 +19,21 @@ services:
       resources:
         limits:
           memory: 512m
+
+  # The HTTP API. Off by default; start it with:
+  #   docker compose --profile server up -d --build
+  skipq:
+    profiles: ["server"]
+    build: .
+    environment:
+      DATABASE_URL: postgres://skipq:skipq@postgres:5432/skipq?sslmode=disable
+      SKIPQ_API_TOKEN: ${SKIPQ_API_TOKEN:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
