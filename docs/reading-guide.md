@@ -7,8 +7,10 @@ Read the code in this order. Each file is short.
 3. `enqueue.go`: inserting jobs, and how idempotency keys survive races.
 4. `lifecycle.go`: claim, ack, fail, release, rescue. The heart of the queue.
 5. `backoff.go`: retry delays.
-6. `pool.go`: goroutines, shutdown. The hardest file; read it last.
+6. `pool.go`: goroutines, heartbeats, shutdown. The hardest file.
 7. Tests in the same order. `concurrency_test.go` is the headline test.
+8. M2: `deadjobs.go`, `observer.go`, `metrics/metrics.go`, `server/server.go`,
+   `cmd/skipq/main.go`.
 
 Try this: delete the line `FOR UPDATE SKIP LOCKED` in `Claim` and run
 `go test -run TestNoJobRunsTwice ./...`. Jobs run several times each. Put it
@@ -46,5 +48,12 @@ back. Then remove `AND attempt = $2` from `Ack` and watch
   package, so they can only use the public API, the same as a real user.
 - **`t.Parallel()`**: lets tests run at the same time. Safe here because each
   test has its own Postgres schema.
+- **`context.WithCancelCause`**: like `WithCancel`, but the cancel call
+  records *why*; `context.Cause(ctx)` returns it. The heartbeat cancels with
+  `ErrLeaseLost` so a handler can tell a lost lease from a timeout.
+- **`http.ServeMux` patterns** (`"GET /v1/jobs/{id}"`): Go 1.22+ routes by
+  method and path, and `r.PathValue("id")` reads the `{id}` part.
+- **Generics** (`func decode[T any](...)` in the server tests): a function
+  that works for any type `T` chosen by the caller.
 - **`-race`**: builds with Go's race detector, which reports two goroutines
   touching the same memory without synchronisation.

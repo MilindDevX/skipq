@@ -66,9 +66,10 @@ Terms used below:
    fails over to an asynchronous replica, the last few committed transactions
    can be lost: an enqueued job can disappear, or an acked job can reappear
    and run again. Use synchronous replication if that matters.
-6. **Handlers are cancelled cooperatively.** On shutdown or lease timeout skipq
-   cancels the handler's `context.Context`. A handler that ignores its context
-   keeps running; skipq stops waiting for it and its job is re-run elsewhere.
+6. **Handlers are cancelled cooperatively.** On shutdown, `JobTimeout` or a
+   lost lease skipq cancels the handler's `context.Context`. A handler that
+   ignores its context keeps running; skipq stops renewing its lease, and the
+   job may be re-run elsewhere while the first copy is still going.
 
 ## 2. Schema
 
@@ -122,7 +123,7 @@ claim query stays fast as history grows.
 Why a separate dead-letter table instead of a `dead` state: dead jobs need a
 human. Keeping them apart makes "what is broken?" one `SELECT * FROM
 skipq_dead_jobs`, keeps them out of the claim index, and lets an operator retry
-one by moving it back (M2 adds an API for that).
+one by moving it back (`RetryDead`, or `POST /v1/dead-jobs/{id}/retry`).
 
 ## 3. State machine
 
@@ -146,7 +147,7 @@ one by moving it back (M2 adds an API for that).
    │                        ▼       expired with no attempts left
    │                   succeeded          │
    │                                      ▼
-   └─ (M2: operator retry) ◄──────── skipq_dead_jobs
+   └─ RetryDead (operator) ◄──────── skipq_dead_jobs
 ```
 
 | From | Event | To | Condition |
@@ -160,6 +161,8 @@ one by moving it back (M2 adds an API for that).
 | running | `Release` | available | graceful shutdown hit its timeout; attempt still counts |
 | running | `Rescue` | available | `lease_expires_at < now()`, `attempt < max_attempts` |
 | running | `Rescue` | dead | `lease_expires_at < now()`, `attempt >= max_attempts` |
+| running | `ExtendLease` (heartbeat) | running | `attempt` matches; lease moves to `now() + Lease` |
+| dead | `RetryDead` | available | idempotency key not taken by a newer job; `attempt` reset to 0 |
 
 Each transition is a single SQL statement, so it is atomic without an explicit
 transaction. The claim is:
@@ -193,11 +196,12 @@ until the lease expires. Every pool runs a rescuer every `RescueInterval`
 used all attempts). Recovery time is roughly lease length plus one rescue
 interval.
 
-Choosing the lease is a trade-off: short leases recover crashed jobs faster
-but re-run slow, healthy jobs. skipq gives the handler a context that is
-cancelled when the lease ends, so a well-behaved handler stops instead of
-racing a second copy. M2 adds lease heartbeats (extending the lease while the
-handler is still running) so long jobs can use short leases.
+The lease no longer limits how long a job may run. While a handler runs, the
+pool renews the lease every `Lease/3` (a heartbeat), so a healthy job keeps it
+however long it takes, and a crashed worker's job comes back within about one
+lease (default 1 min) plus one rescue interval. How long a handler may run is a
+separate setting, `JobTimeout` (default 30 min), after which its context is
+cancelled and the run counts as a failed attempt.
 
 ### 4.2 Worker finishes but the ack is lost
 
@@ -212,6 +216,10 @@ at-least-once, and why handlers must be idempotent.
   reconnects when the database is back.
 - A handler that finished while the database was down cannot ack. Its job is
   rescued after the lease and runs again.
+- Heartbeats fail too. If the pool cannot renew a lease before it would
+  expire, it cancels the handler with `ErrLeaseLost` as the context's cause,
+  because another worker may legitimately claim the job once the database is
+  back.
 - With asynchronous replication, failover can lose recently committed writes
   (see non-guarantee 5). Lost acks mean re-runs (safe under at-least-once);
   lost enqueues mean lost jobs (not safe). The fix is synchronous replication
@@ -231,20 +239,24 @@ at-least-once, and why handlers must be idempotent.
 - A job that crashes the whole worker process still uses up attempts because
   `attempt` is incremented at claim time, and the rescuer dead-letters it.
 
-### 4.5 Slow handler outlives its lease
+### 4.5 A worker loses its lease while the handler runs
 
-The rescuer re-queues the job and another worker may run it while the first
-copy is still running. The first copy's context is cancelled at lease end; if
-it ignores that and later tries to ack, the fenced ack fails with
-`ErrLeaseLost`, so the job's recorded state is never overwritten by a stale
-worker. Side effects of both runs still happen, which is why idempotent
-handlers matter.
+With heartbeats this needs a pause longer than a whole lease: a long
+stop-the-world pause, a laptop going to sleep, or the database unreachable for
+that long. The rescuer re-queues the job and another worker may run it while
+the first copy is still running. When the first worker's next heartbeat finds
+the job reclaimed, it cancels the handler's context with cause `ErrLeaseLost`.
+If the handler ignores that and later returns, the fenced ack or fail affects
+no rows, so the job's recorded state is never overwritten by a stale worker.
+Side effects of both runs still happen, which is why idempotent handlers
+matter.
 
 ### 4.6 Graceful shutdown
 
 Cancelling the context passed to `Pool.Run`:
 
-1. Workers stop claiming new jobs.
+1. Workers stop claiming new jobs. A claim that was already in flight and
+   returns a job after shutdown began releases that job instead of running it.
 2. In-flight handlers keep running until they finish or `ShutdownTimeout`
    (default 30 s) passes.
 3. After the timeout, handler contexts are cancelled. Jobs whose handler
@@ -292,7 +304,33 @@ Payloads are limited to 8000 bytes by default. It is useful as a *wake-up
 signal* on top of a jobs table ("there is new work, go and poll now"), which
 is how skipq will use it in M2.
 
-## 6. Out of scope (for now)
+## 6. HTTP API and metrics
+
+`cmd/skipq` serves the `server` package: `POST /v1/jobs`, `GET /v1/jobs/{id}`,
+`GET /v1/dead-jobs`, `POST /v1/dead-jobs/{id}/retry`, `GET /healthz` and
+`GET /metrics`. Request bodies are capped at 1 MiB; queue, kind and key at 200
+bytes. With `SKIPQ_API_TOKEN` set, `/v1/` needs a bearer token (compared in
+constant time); health and metrics stay open. Without a token the API trusts
+anyone who can reach it, so the default listen address is loopback only.
+
+Metrics come from two places (`metrics` package):
+
+| Metric | Type | Source |
+|---|---|---|
+| `skipq_jobs{queue,state}` | gauge | database, per scrape: available, scheduled, running, dead |
+| `skipq_queue_lag_seconds{queue}` | gauge | database: age of the oldest ready, unclaimed job |
+| `skipq_jobs_enqueued_total{queue,duplicate}` | counter | API process |
+| `skipq_job_runs_total{queue,kind,outcome}` | counter | worker process (Pool observer) |
+| `skipq_job_wait_seconds{queue,kind}` | histogram | worker: run_at to claim, on the database clock |
+| `skipq_job_run_seconds{queue,kind}` | histogram | worker: handler duration |
+
+Database gauges are read at scrape time, so they are right across every
+process; counters and histograms are per process, so each worker process
+exposes its own `/metrics`. Jobs whose kind has no handler are labelled
+`_unknown` so arbitrary kinds from callers cannot create unbounded series.
+Queue names still become label values: keep them to a small fixed set.
+
+## 7. Out of scope (for now)
 
 Workflows and job dependencies, cron-style periodic jobs, cross-queue global
 rate limits (M3 adds per-queue limits), multi-tenant fairness, and a web UI.

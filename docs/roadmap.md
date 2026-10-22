@@ -31,16 +31,23 @@ Must:
 
 ## M2 — Service shape (9 Nov – 22 Nov, 2 weeks)
 
+Built early (22 Oct). The time budget now goes to understanding it and to
+the "cut if late" items.
+
 Must:
-- `cmd/skipq`: a server binary with a small HTTP API
+- [x] `cmd/skipq`: a server binary with a small HTTP API
   - `POST /v1/jobs` (enqueue; honours `Idempotency-Key` header)
   - `GET /v1/jobs/{id}` (status, including dead jobs)
   - `GET /v1/dead-jobs`, `POST /v1/dead-jobs/{id}/retry`
-- Prometheus metrics at `/metrics`: jobs enqueued, running, succeeded, failed,
-  dead (counters/gauges per queue and kind), and a histogram of
-  enqueue-to-start latency and run duration
-- Lease heartbeat: extend the lease while a handler is still running
-- Dockerfile for the server (multi-stage, small image)
+  - optional bearer token, 1 MiB body cap, `/healthz`
+- [x] Prometheus metrics at `/metrics`: job counts per queue and state, queue
+      lag, enqueue counter, runs by outcome, wait and run-time histograms
+- [x] Lease heartbeat, plus a separate `JobTimeout`
+- [x] Dockerfile for the server (multi-stage, distroless, non-root)
+- [x] Fixed an M1 shutdown race: a claim that finished after shutdown began
+      could start a new job (found as a flaky test)
+- [ ] Milind: read `server/`, `metrics/` and the heartbeat in `pool.go` (~5 h)
+- [ ] Milind: run the server with compose and scrape `/metrics` once (~1 h)
 
 Cut if late:
 - LISTEN/NOTIFY wake-ups plus one batched fetcher per pool (replaces

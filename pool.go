@@ -16,7 +16,8 @@ import (
 // Handler does the work for one job. Return nil to mark the job succeeded,
 // an error to retry it (with backoff) or Permanent(err) to dead-letter it.
 //
-// ctx is cancelled when the job's lease ends or when graceful shutdown runs
+// ctx is cancelled when JobTimeout passes, when the job's lease is lost
+// (context.Cause(ctx) is then ErrLeaseLost), or when graceful shutdown runs
 // out of time; long-running handlers should watch ctx.Done(). Because a job
 // can run more than once (see docs/design.md), handlers must be idempotent.
 type Handler func(ctx context.Context, job *Job) error
@@ -27,15 +28,23 @@ type PoolConfig struct {
 	Workers  int                // concurrent jobs; defaults to 10
 	Handlers map[string]Handler // job kind -> handler
 
-	Lease           time.Duration // how long a worker owns a claimed job; defaults to 5m
+	// Lease is how long a claimed job stays owned without a heartbeat. The
+	// pool renews it every Lease/3 while the handler runs, so this bounds how
+	// quickly a crashed worker's jobs come back, not how long a job may run.
+	// Defaults to 1m.
+	Lease time.Duration
+	// JobTimeout is the longest a handler may run before its context is
+	// cancelled. Defaults to 30m.
+	JobTimeout      time.Duration
 	PollInterval    time.Duration // idle wait between claim attempts; defaults to 1s
 	RescueInterval  time.Duration // how often to rescue expired leases; defaults to 30s
 	ShutdownTimeout time.Duration // how long shutdown waits for in-flight jobs; defaults to 30s
 
 	// Backoff returns the retry delay after the given attempt fails.
 	// Defaults to DefaultBackoff.
-	Backoff func(attempt int) time.Duration
-	Logger  *slog.Logger // defaults to slog.Default()
+	Backoff  func(attempt int) time.Duration
+	Observer Observer     // receives job events, e.g. for metrics; optional
+	Logger   *slog.Logger // defaults to slog.Default()
 	// WorkerID prefixes the locked_by value of claimed jobs.
 	// Defaults to "<hostname>-<pid>-<random>".
 	WorkerID string
@@ -67,12 +76,16 @@ func (c *Client) NewPool(cfg PoolConfig) (*Pool, error) {
 	}
 	cfg.Queue = cmp.Or(cfg.Queue, DefaultQueue)
 	cfg.Workers = cmp.Or(cfg.Workers, 10)
-	cfg.Lease = cmp.Or(cfg.Lease, 5*time.Minute)
+	cfg.Lease = cmp.Or(cfg.Lease, time.Minute)
+	cfg.JobTimeout = cmp.Or(cfg.JobTimeout, 30*time.Minute)
 	cfg.PollInterval = cmp.Or(cfg.PollInterval, time.Second)
 	cfg.RescueInterval = cmp.Or(cfg.RescueInterval, 30*time.Second)
 	cfg.ShutdownTimeout = cmp.Or(cfg.ShutdownTimeout, 30*time.Second)
 	if cfg.Backoff == nil {
 		cfg.Backoff = DefaultBackoff
+	}
+	if cfg.Observer == nil {
+		cfg.Observer = nopObserver{}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -81,8 +94,11 @@ func (c *Client) NewPool(cfg PoolConfig) (*Pool, error) {
 		host, _ := os.Hostname()
 		cfg.WorkerID = fmt.Sprintf("%s-%d-%04x", host, os.Getpid(), rand.IntN(0x10000))
 	}
-	if cfg.Workers < 0 || cfg.Lease < 0 || cfg.PollInterval < 0 || cfg.RescueInterval < 0 || cfg.ShutdownTimeout < 0 {
+	if cfg.Workers < 0 || cfg.JobTimeout < 0 || cfg.PollInterval < 0 || cfg.RescueInterval < 0 || cfg.ShutdownTimeout < 0 {
 		return nil, errors.New("skipq: PoolConfig values must not be negative")
+	}
+	if cfg.Lease < 3*time.Millisecond {
+		return nil, errors.New("skipq: PoolConfig.Lease must be at least 3ms")
 	}
 	return &Pool{client: c, cfg: cfg}, nil
 }
@@ -130,6 +146,7 @@ func (p *Pool) work(ctx, handlerCtx context.Context, workerID string) {
 		// Claim on a context that shutdown does not cancel: if the claim
 		// commits on the server, we must get the job back and run or release
 		// it rather than leave it locked until its lease expires.
+		claimedAt := time.Now()
 		claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dbTimeout)
 		jobs, err := p.client.Claim(claimCtx, ClaimParams{
 			Queue: p.cfg.Queue, Limit: 1, WorkerID: workerID, Lease: p.cfg.Lease,
@@ -142,16 +159,44 @@ func (p *Pool) work(ctx, handlerCtx context.Context, workerID string) {
 			sleep(ctx, jitter(p.cfg.PollInterval))
 			continue
 		}
-		p.runJob(handlerCtx, jobs[0])
+		if ctx.Err() != nil {
+			// Shutdown began while the claim was in flight. Hand the job
+			// back instead of starting new work.
+			p.release(handlerCtx, jobs[0])
+			return
+		}
+		p.runJob(handlerCtx, jobs[0], claimedAt)
 	}
 }
 
-func (p *Pool) runJob(handlerCtx context.Context, job *Job) {
-	jobCtx, cancel := context.WithTimeout(handlerCtx, p.cfg.Lease)
-	defer cancel()
+func (p *Pool) runJob(handlerCtx context.Context, job *Job, claimedAt time.Time) {
+	handler, known := p.cfg.Handlers[job.Kind]
+	event := JobEvent{
+		Queue:   job.Queue,
+		Kind:    job.Kind,
+		JobID:   job.ID,
+		Attempt: job.Attempt,
+		Wait:    max(job.UpdatedAt.Sub(job.RunAt), 0), // both set by the database at claim time
+	}
+	if !known {
+		event.Kind = UnknownKind
+	}
+	p.cfg.Observer.JobStarted(event)
 
+	// jobCtx ends on shutdown timeout (via handlerCtx), JobTimeout, or a lost
+	// lease (cancelLease, with ErrLeaseLost as the cause).
+	leaseCtx, cancelLease := context.WithCancelCause(handlerCtx)
+	defer cancelLease(nil)
+	jobCtx, cancelTimeout := context.WithTimeout(leaseCtx, p.cfg.JobTimeout)
+	defer cancelTimeout()
+	stopHeartbeat := p.heartbeat(jobCtx, cancelLease, job, claimedAt)
+
+	// The handler gets its own copy of the job, so nothing it does to the
+	// struct can affect the heartbeat or the result we record.
+	handlerJob := *job
+	start := time.Now()
 	result := make(chan error, 1) // buffered so an abandoned handler can still send and exit
-	go func() { result <- p.callHandler(jobCtx, job) }()
+	go func() { result <- p.callHandler(jobCtx, handler, &handlerJob) }()
 
 	var err error
 	select {
@@ -163,41 +208,128 @@ func (p *Pool) runJob(handlerCtx context.Context, job *Job) {
 			err = errAbandoned
 		}
 	}
+	stopHeartbeat()
 
-	dbCtx, cancelDB := context.WithTimeout(context.WithoutCancel(handlerCtx), dbTimeout)
-	defer cancelDB()
+	event.Duration = time.Since(start)
+	event.Err = err
+	event.Outcome = p.record(handlerCtx, leaseCtx, job, err)
+	p.cfg.Observer.JobFinished(event)
+}
+
+// record writes the handler's result to the database and reports the outcome.
+func (p *Pool) record(handlerCtx, leaseCtx context.Context, job *Job, err error) Outcome {
 	log := p.cfg.Logger.With("job_id", job.ID, "kind", job.Kind, "attempt", job.Attempt)
-
-	switch {
-	case err == nil:
-		if ackErr := p.client.Ack(dbCtx, job); ackErr != nil {
-			log.Error("skipq: ack failed; job will run again after its lease", "err", ackErr)
-		}
-	case handlerCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, errAbandoned)):
+	if errors.Is(context.Cause(leaseCtx), ErrLeaseLost) {
+		log.Warn("skipq: lease lost while running; result not recorded", "err", err)
+		return OutcomeLeaseLost
+	}
+	if handlerCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, errAbandoned)) {
 		// Interrupted by shutdown, not a real failure: hand it back.
-		if relErr := p.client.Release(dbCtx, job); relErr != nil {
-			log.Error("skipq: release failed; job will run again after its lease", "err", relErr)
-		} else {
-			log.Info("skipq: released unfinished job at shutdown")
+		p.release(handlerCtx, job)
+		return OutcomeReleased
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(handlerCtx), dbTimeout)
+	defer cancel()
+
+	if err == nil {
+		switch ackErr := p.client.Ack(ctx, job); {
+		case errors.Is(ackErr, ErrLeaseLost):
+			log.Warn("skipq: job finished but its lease was lost; another worker owns it")
+			return OutcomeLeaseLost
+		case ackErr != nil:
+			log.Error("skipq: ack failed; job will run again after its lease", "err", ackErr)
+			return OutcomeRecordFailed
 		}
+		return OutcomeSucceeded
+	}
+
+	state, failErr := p.client.Fail(ctx, job, err, p.cfg.Backoff(job.Attempt))
+	switch {
+	case errors.Is(failErr, ErrLeaseLost):
+		log.Warn("skipq: job failed but its lease was lost; another worker owns it", "job_err", err)
+		return OutcomeLeaseLost
+	case failErr != nil:
+		log.Error("skipq: recording failure failed", "err", failErr, "job_err", err)
+		return OutcomeRecordFailed
+	case state == StateDead:
+		log.Error("skipq: job dead-lettered", "err", err)
+		return OutcomeDead
 	default:
-		state, failErr := p.client.Fail(dbCtx, job, err, p.cfg.Backoff(job.Attempt))
-		switch {
-		case failErr != nil:
-			log.Error("skipq: recording failure failed", "err", failErr, "job_err", err)
-		case state == StateDead:
-			log.Error("skipq: job dead-lettered", "err", err)
-		default:
-			log.Warn("skipq: job failed; will retry", "err", err)
-		}
+		log.Warn("skipq: job failed; will retry", "err", err)
+		return OutcomeRetried
 	}
 }
 
-// callHandler runs the handler for job.Kind, turning a panic into an error so
-// one bad job cannot crash the whole process.
-func (p *Pool) callHandler(ctx context.Context, job *Job) (err error) {
-	h, ok := p.cfg.Handlers[job.Kind]
-	if !ok {
+// heartbeat renews job's lease every Lease/3 until stop is called or jobCtx
+// ends. If the job turns out to be reclaimed, or the lease runs out while the
+// database is unreachable, it cancels the job with ErrLeaseLost so the
+// handler stops instead of racing another worker.
+func (p *Pool) heartbeat(jobCtx context.Context, cancelJob context.CancelCauseFunc, job *Job, claimedAt time.Time) (stop func()) {
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		interval := p.cfg.Lease / 3
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		// The database set the lease to (its now) + Lease, and its now came
+		// after we sent the request, so local send time + Lease is a safe
+		// lower bound for when the lease ends, whatever the clocks say.
+		leaseEnd := claimedAt.Add(p.cfg.Lease)
+		for {
+			select {
+			case <-done:
+				return
+			case <-jobCtx.Done():
+				return
+			case <-timer.C:
+			}
+			// A renewal may take as long as the lease is still valid: a slow
+			// database is not a reason to give up a lease we still hold.
+			sent := time.Now()
+			ctx, cancel := context.WithDeadline(context.WithoutCancel(jobCtx), leaseEnd)
+			_, err := p.client.ExtendLease(ctx, job, p.cfg.Lease)
+			cancel()
+			switch {
+			case err == nil:
+				leaseEnd = sent.Add(p.cfg.Lease)
+				timer.Reset(interval)
+			case errors.Is(err, ErrLeaseLost):
+				cancelJob(ErrLeaseLost)
+				return
+			case !time.Now().Before(leaseEnd):
+				cancelJob(fmt.Errorf("%w: could not renew before it expired: %v", ErrLeaseLost, err))
+				return
+			default:
+				// Still inside the lease: retry soon rather than a full interval later.
+				p.cfg.Logger.Warn("skipq: lease renewal failed; will retry", "job_id", job.ID, "err", err)
+				timer.Reset(min(interval/4, time.Until(leaseEnd)))
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
+}
+
+// release hands a job back at shutdown so another process can claim it now.
+func (p *Pool) release(handlerCtx context.Context, job *Job) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(handlerCtx), dbTimeout)
+	defer cancel()
+	log := p.cfg.Logger.With("job_id", job.ID, "kind", job.Kind, "attempt", job.Attempt)
+	if err := p.client.Release(ctx, job); err != nil {
+		log.Error("skipq: release failed; job will run again after its lease", "err", err)
+		return
+	}
+	log.Info("skipq: released unfinished job at shutdown")
+}
+
+// callHandler runs handler, turning a panic into an error so one bad job
+// cannot crash the whole process. A nil handler means the kind is unknown.
+func (p *Pool) callHandler(ctx context.Context, handler Handler, job *Job) (err error) {
+	if handler == nil {
 		return Permanent(fmt.Errorf("no handler registered for kind %q", job.Kind))
 	}
 	defer func() {
@@ -205,7 +337,7 @@ func (p *Pool) callHandler(ctx context.Context, job *Job) (err error) {
 			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
 		}
 	}()
-	return h(ctx, job)
+	return handler(ctx, job)
 }
 
 func (p *Pool) rescueLoop(ctx context.Context) {

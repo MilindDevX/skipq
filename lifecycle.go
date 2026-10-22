@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Every statement below that changes a running job matches on
@@ -83,6 +85,26 @@ func (c *Client) Ack(ctx context.Context, job *Job) error {
 		return ErrLeaseLost
 	}
 	return nil
+}
+
+// ExtendLease pushes a running job's lease to now + lease and returns the new
+// expiry. Pool calls it periodically (a heartbeat) so long jobs can use short
+// leases. It returns ErrLeaseLost if the job was reclaimed.
+func (c *Client) ExtendLease(ctx context.Context, job *Job, lease time.Duration) (time.Time, error) {
+	var expires time.Time
+	err := c.db.QueryRow(ctx, `
+		UPDATE skipq_jobs
+		SET lease_expires_at = now() + $3 * interval '1 microsecond'
+		WHERE id = $1 AND state = 'running' AND attempt = $2
+		RETURNING lease_expires_at`,
+		job.ID, job.Attempt, lease.Microseconds()).Scan(&expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrLeaseLost
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("skipq: extend lease of job %d: %w", job.ID, err)
+	}
+	return expires, nil
 }
 
 // Fail records a failed attempt. If attempts remain and jobErr is not
