@@ -27,7 +27,7 @@ Must:
       watch which test fails (~8 h)
 - [ ] Milind: write a short "how a job flows" note in your own words (~2 h)
 - [x] GitHub Actions CI workflow written (`.github/workflows/ci.yml`)
-- [ ] CI: confirm it passes on the first push (~1 h if it needs fixes)
+- [x] CI: passes on GitHub Actions (gofmt, vet, `go test -race` with Postgres 17)
 
 ## M2 — Service shape (9 Nov – 22 Nov, 2 weeks)
 
