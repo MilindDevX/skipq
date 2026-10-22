@@ -3,8 +3,10 @@ package skipq_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,16 +178,13 @@ func TestPoolRescuesJobFromCrashedWorker(t *testing.T) {
 	}
 }
 
-func TestPoolHandlerContextEndsWithLease(t *testing.T) {
+func TestPoolHandlerContextEndsAtJobTimeout(t *testing.T) {
 	t.Parallel()
 	c := skipq.New(newTestDB(t))
 	startPool(t, c, skipq.PoolConfig{
-		Lease: 50 * time.Millisecond,
+		JobTimeout: 50 * time.Millisecond,
 		Handlers: map[string]skipq.Handler{
 			"slow": func(ctx context.Context, job *skipq.Job) error {
-				if _, ok := ctx.Deadline(); !ok {
-					return skipq.Permanent(errors.New("handler context has no deadline"))
-				}
 				<-ctx.Done()
 				return skipq.Permanent(ctx.Err())
 			},
@@ -194,7 +193,148 @@ func TestPoolHandlerContextEndsWithLease(t *testing.T) {
 
 	job := waitForState(t, c, mustEnqueue(t, c, skipq.EnqueueParams{Kind: "slow"}).ID, skipq.StateDead)
 	if job.LastError != context.DeadlineExceeded.Error() {
-		t.Fatalf("expected the lease deadline to cancel the handler, got %q", job.LastError)
+		t.Fatalf("expected JobTimeout to cancel the handler, got %q", job.LastError)
+	}
+}
+
+func TestHeartbeatKeepsLongJobFromBeingRescued(t *testing.T) {
+	t.Parallel()
+	c := skipq.New(newTestDB(t))
+	var runs atomic.Int32
+	startPool(t, c, skipq.PoolConfig{
+		Lease:          time.Second,           // heartbeat about every 330ms
+		RescueInterval: 20 * time.Millisecond, // rescuer is eager to steal it
+		Handlers: map[string]skipq.Handler{
+			"long": func(ctx context.Context, job *skipq.Job) error {
+				runs.Add(1)
+				select {
+				case <-time.After(3 * time.Second): // 3x the lease
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		},
+	})
+
+	job := waitForState(t, c, mustEnqueue(t, c, skipq.EnqueueParams{Kind: "long"}).ID, skipq.StateSucceeded)
+	if job.Attempt != 1 || runs.Load() != 1 {
+		t.Fatalf("job should run once on attempt 1; attempt=%d runs=%d", job.Attempt, runs.Load())
+	}
+}
+
+func TestHandlerIsCancelledWhenLeaseIsLost(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	c := skipq.New(db)
+	started := make(chan int64, 1)
+	cause := make(chan error, 1)
+	startPool(t, c, skipq.PoolConfig{
+		Lease: 150 * time.Millisecond,
+		Handlers: map[string]skipq.Handler{
+			"k": func(ctx context.Context, job *skipq.Job) error {
+				started <- job.ID
+				<-ctx.Done()
+				cause <- context.Cause(ctx)
+				return ctx.Err()
+			},
+		},
+	})
+	mustEnqueue(t, c, skipq.EnqueueParams{Kind: "k"})
+
+	id := <-started
+	// Simulate another worker reclaiming the job: bump the fencing token.
+	if _, err := db.Exec(context.Background(), "UPDATE skipq_jobs SET attempt = attempt + 1 WHERE id = $1", id); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-cause:
+		if !errors.Is(err, skipq.ErrLeaseLost) {
+			t.Fatalf("context cause = %v, want ErrLeaseLost", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler was not cancelled after its lease was lost")
+	}
+}
+
+type recordingObserver struct {
+	mu       sync.Mutex
+	started  []skipq.JobEvent
+	finished []skipq.JobEvent
+}
+
+func (o *recordingObserver) JobStarted(e skipq.JobEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.started = append(o.started, e)
+}
+
+func (o *recordingObserver) JobFinished(e skipq.JobEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.finished = append(o.finished, e)
+}
+
+func (o *recordingObserver) outcomes() map[string][]skipq.Outcome {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	m := map[string][]skipq.Outcome{}
+	for _, e := range o.finished {
+		m[e.Kind] = append(m[e.Kind], e.Outcome)
+	}
+	return m
+}
+
+func TestPoolReportsEventsToObserver(t *testing.T) {
+	t.Parallel()
+	c := skipq.New(newTestDB(t))
+	obs := &recordingObserver{}
+	startPool(t, c, skipq.PoolConfig{
+		Observer: obs,
+		Handlers: map[string]skipq.Handler{
+			"ok": func(context.Context, *skipq.Job) error { return nil },
+			"flaky": func(ctx context.Context, job *skipq.Job) error {
+				if job.Attempt == 1 {
+					return errors.New("first try fails")
+				}
+				return nil
+			},
+			"bad": func(context.Context, *skipq.Job) error { return skipq.Permanent(errors.New("no")) },
+		},
+	})
+	ids := []int64{
+		mustEnqueue(t, c, skipq.EnqueueParams{Kind: "ok"}).ID,
+		mustEnqueue(t, c, skipq.EnqueueParams{Kind: "flaky"}).ID,
+		mustEnqueue(t, c, skipq.EnqueueParams{Kind: "bad"}).ID,
+		mustEnqueue(t, c, skipq.EnqueueParams{Kind: "who-knows"}).ID,
+	}
+	waitForState(t, c, ids[0], skipq.StateSucceeded)
+	waitForState(t, c, ids[1], skipq.StateSucceeded)
+	waitForState(t, c, ids[2], skipq.StateDead)
+	waitForState(t, c, ids[3], skipq.StateDead)
+
+	got := obs.outcomes()
+	want := map[string][]skipq.Outcome{
+		"ok":       {skipq.OutcomeSucceeded},
+		"flaky":    {skipq.OutcomeRetried, skipq.OutcomeSucceeded},
+		"bad":      {skipq.OutcomeDead},
+		"_unknown": {skipq.OutcomeDead}, // unregistered kinds share one label
+	}
+	for kind, w := range want {
+		if fmt.Sprint(got[kind]) != fmt.Sprint(w) {
+			t.Errorf("kind %s: outcomes %v, want %v", kind, got[kind], w)
+		}
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.started) != 5 {
+		t.Errorf("started events = %d, want 5", len(obs.started))
+	}
+	for _, e := range obs.started {
+		if e.Queue != "default" || e.Wait < 0 || e.Wait > 10*time.Second {
+			t.Errorf("bad started event: %+v", e)
+		}
 	}
 }
 

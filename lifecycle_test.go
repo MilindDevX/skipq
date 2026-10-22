@@ -288,3 +288,41 @@ func TestReleaseMakesJobClaimableImmediately(t *testing.T) {
 		t.Fatalf("released job: %+v", again)
 	}
 }
+
+func TestExtendLeaseMovesExpiryForward(t *testing.T) {
+	t.Parallel()
+	c := skipq.New(newTestDB(t))
+	ctx := context.Background()
+	mustEnqueue(t, c, skipq.EnqueueParams{Kind: "k"})
+	job := claimOne(t, c, 50*time.Millisecond)
+
+	expires, err := c.ExtendLease(ctx, job, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Until(expires) < 59*time.Minute {
+		t.Fatalf("lease should now end in about an hour, got %v", expires)
+	}
+
+	time.Sleep(100 * time.Millisecond) // past the original 50ms lease
+	if res, err := c.Rescue(ctx); err != nil || res.Retried != 0 {
+		t.Fatalf("extended job must not be rescued: %+v %v", res, err)
+	}
+}
+
+func TestExtendLeaseFailsAfterReclaim(t *testing.T) {
+	t.Parallel()
+	c := skipq.New(newTestDB(t))
+	ctx := context.Background()
+	mustEnqueue(t, c, skipq.EnqueueParams{Kind: "k"})
+	stale := claimOne(t, c, 20*time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+	if _, err := c.Rescue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claimOne(t, c, time.Minute)
+
+	if _, err := c.ExtendLease(ctx, stale, time.Hour); !errors.Is(err, skipq.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+}
