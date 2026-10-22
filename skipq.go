@@ -120,29 +120,15 @@ func (c *Client) Get(ctx context.Context, id int64) (*Job, error) {
 		return nil, fmt.Errorf("skipq: get job %d: %w", id, err)
 	}
 
-	var (
-		j                Job
-		lastErr, idemKey *string
-		deadAt           time.Time
-	)
-	err = c.db.QueryRow(ctx, `
-		SELECT id, queue, kind, payload, priority, attempt, max_attempts, last_error,
-		       idempotency_key, created_at, dead_at
-		FROM skipq_dead_jobs WHERE id = $1`, id).
-		Scan(&j.ID, &j.Queue, &j.Kind, &j.Payload, &j.Priority, &j.Attempt, &j.MaxAttempts,
-			&lastErr, &idemKey, &j.CreatedAt, &deadAt)
+	job, err = scanDeadJob(c.db.QueryRow(ctx,
+		`SELECT `+deadJobColumns+` FROM skipq_dead_jobs WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("skipq: get dead job %d: %w", id, err)
 	}
-	j.State = StateDead
-	j.LastError = deref(lastErr)
-	j.IdempotencyKey = deref(idemKey)
-	j.UpdatedAt = deadAt
-	j.FinishedAt = &deadAt
-	return &j, nil
+	return job, nil
 }
 
 func deref(s *string) string {
