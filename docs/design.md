@@ -60,8 +60,8 @@ Terms used below:
 3. **No exact scheduling.** A job with `run_at = 10:00:00` runs at the first
    poll at or after 10:00:00, so up to one poll interval late (1 s by default).
 4. **Idempotency window is the row's lifetime.** The key is unique only while
-   the row is in `skipq_jobs`. After a job is dead-lettered (and, from M2, after
-   retention deletes old succeeded jobs), the same key can be enqueued again.
+   the row is in `skipq_jobs`. After a job is dead-lettered, the same key can be
+   enqueued again. Succeeded jobs are never deleted, so their keys stay taken.
 5. **Not durable against losing committed writes.** If the Postgres primary
    fails over to an asynchronous replica, the last few committed transactions
    can be lost: an enqueued job can disappear, or an acked job can reappear
@@ -267,10 +267,11 @@ Cancelling the context passed to `Pool.Run`:
 
 ### 4.7 Thundering herd and idle load
 
-In M1 each worker polls independently (one cheap indexed query per worker per
-poll interval, with jitter). With 100 idle workers and a 1 s interval that is
-100 queries per second. M2 adds LISTEN/NOTIFY wake-ups and a single fetcher
-per pool that claims in batches, which removes most idle polling.
+Each worker polls independently (one cheap indexed query per worker per poll
+interval, with jitter). With 100 idle workers and a 1 s interval that is 100
+queries per second. LISTEN/NOTIFY wake-ups and a single fetcher per pool that
+claims in batches would remove most idle polling; neither is built yet (see
+"Maybe later" in the roadmap).
 
 ## 5. Comparison
 
@@ -302,7 +303,7 @@ from updates) that autovacuum must clean.
 that are listening at that moment; if a worker is down, the message is gone.
 Payloads are limited to 8000 bytes by default. It is useful as a *wake-up
 signal* on top of a jobs table ("there is new work, go and poll now"), which
-is how skipq will use it in M2.
+is how skipq would use it if wake-ups are added.
 
 ## 6. HTTP API and metrics
 
@@ -332,5 +333,5 @@ Queue names still become label values: keep them to a small fixed set.
 
 ## 7. Out of scope (for now)
 
-Workflows and job dependencies, cron-style periodic jobs, cross-queue global
-rate limits (M3 adds per-queue limits), multi-tenant fairness, and a web UI.
+Workflows and job dependencies, cron-style periodic jobs, rate limits,
+multi-tenant fairness, deleting old succeeded jobs, and a web UI.
